@@ -11,6 +11,7 @@ import torch.distributed as dist
 from compressed_tensors.distributed import is_source_process
 from compressed_tensors.offload import (
     disable_onloading,
+    dispatch_with_map,
     from_accelerate,
     load_offloaded_model,
 )
@@ -216,3 +217,29 @@ def test_dist_disk_safetensors_update(tmp_path):
                 with open(file_path, "rb") as f:
                     current_hash = hashlib.sha256(f.read()).hexdigest()
                 assert current_hash == original_hash
+
+
+@pytest.mark.unit
+def test_dispatch_with_map_skips_none_modules():
+    """dispatch_with_map should skip modules that don't exist on the local rank,
+    e.g. None slots in nn.ModuleList for sharded MoE experts."""
+
+    class ShardedModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.experts = torch.nn.ModuleList(
+                [None, torch.nn.Linear(8, 8), None, torch.nn.Linear(8, 8)]
+            )
+
+    model = ShardedModel()
+
+    device_map = {
+        "": (None, None),
+        "experts": (None, None),
+        "experts.0": (torch.device("cpu"), None),
+        "experts.1": (torch.device("cpu"), None),
+        "experts.2": (torch.device("cpu"), None),
+        "experts.3": (torch.device("cpu"), None),
+    }
+
+    dispatch_with_map(model, device_map, show_progress=False)

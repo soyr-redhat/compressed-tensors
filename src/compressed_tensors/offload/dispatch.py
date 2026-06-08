@@ -92,7 +92,10 @@ def dispatch_with_map(
     for name, (onload_device, offload_device) in tqdm(
         list(device_map.items()), desc="Dispatching model", disable=(not show_progress)
     ):
-        module = model.get_submodule(name)
+        try:
+            module = model.get_submodule(name)
+        except AttributeError:
+            continue
 
         if offload_device == "disk":
             offload_module(
