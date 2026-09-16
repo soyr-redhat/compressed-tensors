@@ -115,23 +115,26 @@ def convert_checkpoint(
     # Validate before long-running procssing job
     exec_jobs(validate_jobs, max_workers, desc="Validating")
 
-    # Process weights, accumulating total bytes used and the new weight_map
+    # Process weights, accumulating total bytes used and the new weight_map.
+    # exec_jobs_dynamic handles CPU natively (running sequentially), so the same
+    # scheduler drives both CPU and accelerator runs. Memory estimates are only
+    # consulted for accelerator scheduling, so skip the profiler on CPU.
     total_size = 0
     weight_map = dict()
-    if all(dev.type == "cpu" for dev in devices):
-        convert_results = exec_jobs(convert_jobs, max_workers, desc="Converting")
-    else:
-        callable_jobs = [partial(job[0], *job[1:]) for job in convert_jobs]
+    callable_jobs = [partial(job[0], *job[1:]) for job in convert_jobs]
+    if any(dev.type != "cpu" for dev in devices):
         memory_estimates = [
             job_memory_estimator(job[1], converters) for job in convert_jobs
         ]
-        convert_results = exec_jobs_dynamic(
-            jobs=callable_jobs,
-            devices=devices,
-            max_workers=max_workers,
-            memory_estimates=memory_estimates,
-            desc="Converting",
-        )
+    else:
+        memory_estimates = [0] * len(callable_jobs)
+    convert_results = exec_jobs_dynamic(
+        jobs=callable_jobs,
+        devices=devices,
+        max_workers=max_workers,
+        memory_estimates=memory_estimates,
+        desc="Converting",
+    )
     for _total_size, _weight_map in convert_results:
         total_size += _total_size
         weight_map.update(_weight_map)

@@ -80,7 +80,7 @@ class ConfigAppendingConverter(NoOpConverter):
         (None, [torch.device("cpu")]),
     ),
 )
-def test_convert_checkpoint_preserves_threaded_cpu_path(
+def test_convert_checkpoint_cpu_uses_dynamic_scheduler(
     get_checkpoint_files,
     get_weight_map,
     build_inverse_weight_maps,
@@ -96,8 +96,10 @@ def test_convert_checkpoint_preserves_threaded_cpu_path(
     get_checkpoint_files.return_value = model_files
     get_weight_map.return_value = {"weight": "model.safetensors"}
     build_inverse_weight_maps.return_value = {"model.safetensors": inverse_weight_map}
-    exec_jobs.side_effect = [[], [(4, {"weight": "model.safetensors"})]]
+    exec_jobs.return_value = []  # validation phase
+    exec_jobs_dynamic.return_value = [(4, {"weight": "model.safetensors"})]
     converter = Mock()
+    job_memory_estimator = Mock()
 
     with patch(f"{_CHECKPOINT_MODULE}._resolve_devices", return_value=resolved_devices):
         convert_checkpoint(
@@ -106,17 +108,23 @@ def test_convert_checkpoint_preserves_threaded_cpu_path(
             converter,
             max_workers=2,
             device=device,
+            job_memory_estimator=job_memory_estimator,
         )
 
-    assert exec_jobs.call_args_list[0].kwargs == {
-        "desc": "Validating",
-    }
-    assert exec_jobs.call_args_list[0].args[1] == 2
-    assert exec_jobs.call_args_list[1].kwargs == {
-        "desc": "Converting",
-    }
-    assert exec_jobs.call_args_list[1].args[1] == 2
-    exec_jobs_dynamic.assert_not_called()
+    # validation still runs through exec_jobs
+    exec_jobs.assert_called_once()
+    assert exec_jobs.call_args.kwargs == {"desc": "Validating"}
+    assert exec_jobs.call_args.args[1] == 2
+
+    # conversion is scheduled through exec_jobs_dynamic even on CPU, with zero
+    # memory estimates and without invoking the profiler
+    dynamic_call = exec_jobs_dynamic.call_args
+    assert dynamic_call.kwargs["devices"] == resolved_devices
+    assert dynamic_call.kwargs["max_workers"] == 2
+    assert dynamic_call.kwargs["memory_estimates"] == [0]
+    assert dynamic_call.kwargs["desc"] == "Converting"
+    job_memory_estimator.assert_not_called()
+
     write_checkpoint_quantization_config.assert_called_once_with(tmp_path, [converter])
     update_safetensors_index.assert_called_once_with(
         tmp_path, 4, {"weight": "model.safetensors"}
