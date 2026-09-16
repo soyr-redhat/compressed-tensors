@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import inspect
 import json
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -13,6 +14,7 @@ from compressed_tensors.entrypoints.convert.convert_file import (
     convert_file,
     write_checkpoint_quantization_config,
 )
+from compressed_tensors.entrypoints.convert.memory import estimate_job_memory
 from compressed_tensors.quantization import (
     QuantizationArgs,
     QuantizationConfig,
@@ -74,7 +76,8 @@ class ConfigAppendingConverter(NoOpConverter):
     ("device", "resolved_devices"),
     (
         ("cpu", [torch.device("cpu")]),
-        (None, [torch.device("cuda:0")]),
+        # device=None on a host with no accelerator resolves to CPU
+        (None, [torch.device("cpu")]),
     ),
 )
 def test_convert_checkpoint_preserves_threaded_cpu_path(
@@ -158,7 +161,7 @@ def test_convert_checkpoint_schedules_accelerator_jobs(
     )
 
     exec_jobs.assert_called_once()
-    job_memory_estimator.assert_called_once_with(inverse_weight_map)
+    job_memory_estimator.assert_called_once_with(inverse_weight_map, [converter])
     dynamic_call = exec_jobs_dynamic.call_args
     assert dynamic_call.kwargs["devices"] == [
         torch.device("cuda:0"),
@@ -214,14 +217,11 @@ def test_convert_checkpoint_rejects_empty_device_list(get_checkpoint_files, tmp_
     get_checkpoint_files.assert_not_called()
 
 
-@patch(f"{_CHECKPOINT_MODULE}.get_checkpoint_files")
-def test_convert_checkpoint_requires_estimator_for_accelerator(
-    get_checkpoint_files, tmp_path
-):
-    with pytest.raises(ValueError, match="job_memory_estimator"):
-        convert_checkpoint("source", tmp_path, Mock(), device="cuda:0")
-
-    get_checkpoint_files.assert_not_called()
+def test_convert_checkpoint_defaults_to_meta_estimator():
+    default = (
+        inspect.signature(convert_checkpoint).parameters["job_memory_estimator"].default
+    )
+    assert default is estimate_job_memory
 
 
 def test_resolve_devices_uses_all_accelerators_by_default():

@@ -53,6 +53,12 @@ def write_checkpoint_quantization_config(
             config_data = json.load(file)
 
         existing_config_data = config_data.get(QUANTIZATION_CONFIG_NAME)
+        if existing_config_data is not None:
+            logger.warning(
+                f"Found an existing quantization config in {config_file_path}. "
+                "It will be passed to the converters and may be preserved, "
+                "extended, or overwritten by this conversion."
+            )
         if isinstance(existing_config_data, dict):
             existing_config_data = dict(existing_config_data)
             existing_config_data.pop(COMPRESSION_VERSION_NAME, None)
