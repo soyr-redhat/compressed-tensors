@@ -176,6 +176,8 @@ def to_tensor(dst: torch.Tensor, src: TensorCls) -> TensorCls:
     """
     Copy the subclass, dict, and attributes into `dst` from `src`
 
+    Gradients are restored only for floating-point or complex destination dtypes.
+
     :param dst: tensor to copy attributes into
     :param src: tensor to copy attributes from
     :return: dst tensor with copied attributes
