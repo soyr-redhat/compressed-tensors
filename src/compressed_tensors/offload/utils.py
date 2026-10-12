@@ -182,7 +182,10 @@ def to_tensor(dst: torch.Tensor, src: TensorCls) -> TensorCls:
     """
     dst.__class__ = src.__class__
     dst.__dict__ = src.__dict__.copy()
-    dst.requires_grad = src.requires_grad
+    # Match Tensor.to: integer and boolean destinations cannot require gradients.
+    dst.requires_grad = src.requires_grad and (
+        dst.is_floating_point() or dst.is_complex()
+    )
     return dst
 
 

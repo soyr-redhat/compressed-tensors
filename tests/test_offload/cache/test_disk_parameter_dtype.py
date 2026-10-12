@@ -21,15 +21,19 @@ def isolated_disk_index(monkeypatch):
 @pytest.mark.unit
 @pytest.mark.parametrize("method", ["onload", "stage"])
 @pytest.mark.parametrize("checkpoint_dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("requires_grad", [False, True])
 def test_disk_read_preserves_parameter_after_dtype_cast(
-    tmp_path, method, checkpoint_dtype
+    tmp_path, method, checkpoint_dtype, requires_grad
 ):
     parameter = torch.nn.Parameter(
-        torch.arange(16, dtype=torch.bfloat16).reshape(4, 4), requires_grad=False
+        torch.arange(16, dtype=torch.bfloat16).reshape(4, 4),
+        requires_grad=requires_grad,
     )
     parameter.test_metadata = "preserve"
     cache = DiskCache("cpu", offload_dir=tmp_path)
     offloaded = cache.offload(parameter)
+    # Seed the checkpoint template independently of the no-grad offload transfer.
+    offloaded.requires_grad_(requires_grad)
     entry = DiskCache.index[offloaded]
     save_file(
         {"weight": parameter.data.to(checkpoint_dtype)}, entry["safetensors_file"]
@@ -42,6 +46,33 @@ def test_disk_read_preserves_parameter_after_dtype_cast(
     assert onloaded.requires_grad == parameter.requires_grad
     assert onloaded.test_metadata == parameter.test_metadata
     assert torch.equal(onloaded, parameter)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("method", ["onload", "stage"])
+@pytest.mark.parametrize(
+    "target_dtype", [torch.int8, torch.uint8, torch.int32, torch.bool]
+)
+@pytest.mark.parametrize("requires_grad", [False, True])
+def test_disk_integer_cast_preserves_parameter_without_gradients(
+    tmp_path, method, target_dtype, requires_grad
+):
+    parameter = torch.nn.Parameter(
+        torch.tensor([-1.75, -0.25, 0.0, 2.5]), requires_grad=requires_grad
+    )
+    parameter.test_metadata = "preserve"
+    cache = DiskCache("cpu", offload_dir=tmp_path)
+    offloaded = cache.offload(parameter)
+    offloaded.requires_grad_(requires_grad)
+    DiskCache.index[offloaded]["dtype"] = str(target_dtype).removeprefix("torch.")
+
+    onloaded = getattr(cache, method)(offloaded)
+
+    assert isinstance(onloaded, torch.nn.Parameter)
+    assert onloaded.dtype == target_dtype
+    assert not onloaded.requires_grad
+    assert onloaded.test_metadata == parameter.test_metadata
+    assert torch.equal(onloaded, parameter.detach().to(target_dtype))
 
 
 class _OffloadedModel(PreTrainedModel):
