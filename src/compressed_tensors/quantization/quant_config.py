@@ -14,7 +14,7 @@ from compressed_tensors.quantization.quant_scheme import (
 )
 from compressed_tensors.quantization.utils import is_module_quantized
 from compressed_tensors.utils import find_unique_name
-from compressed_tensors.utils.match import match_name
+from compressed_tensors.utils.match import match_name, match_targets
 from pydantic import BaseModel, ConfigDict, Field
 from torch.nn import Module
 
@@ -259,27 +259,40 @@ class QuantizationConfig(BaseModel):
 
         consolidated_ignore = _map_to_checkpoint_names(model, consolidated_ignore)
 
+        named_modules = {}
+        checkpoint_names = {}
+        renamed_modules = {}
+        if getattr(model, "_weight_conversions", None):
+            named_modules = dict(model.named_modules())
+            checkpoint_names = dict(
+                zip(named_modules, _map_to_checkpoint_names(model, list(named_modules)))
+            )
+            renamed_modules = {
+                name: module
+                for name, module in named_modules.items()
+                if checkpoint_names[name] != name
+            }
+
         # create config groups from all unique schemes
         config_groups = {}
         for idx, scheme in enumerate(quantization_schemes):
-            if getattr(model, "_weight_conversions", None):
-                names = [
-                    name
-                    for name, module in model.named_modules()
-                    if getattr(module, "quantization_scheme", None) == scheme
-                ]
-                if any(
-                    match_name(name, target)
-                    for name in names
-                    for target in scheme.targets
-                ):
-                    # Use assigned schemes so overlapping groups keep their
-                    # original module selections when resolving name/regex targets.
-                    # Broad regexes expand to explicit checkpoint names: larger
-                    # configs preserve assignments across overlapping groups.
-                    scheme = scheme.model_copy(
-                        update={"targets": _map_to_checkpoint_names(model, names)}
-                    )
+            # Preserve compact targets unless renaming changes their matches or
+            # specificity. Check other groups' modules too: a rename can bring
+            # them into this scheme's regex. Expand from actual assignments.
+            if any(
+                match_targets(name, module, scheme.targets)
+                != match_targets(checkpoint_names[name], module, scheme.targets)
+                for name, module in renamed_modules.items()
+            ):
+                scheme = scheme.model_copy(
+                    update={
+                        "targets": [
+                            checkpoint_names[name]
+                            for name, module in named_modules.items()
+                            if getattr(module, "quantization_scheme", None) == scheme
+                        ]
+                    }
+                )
             group_name = "group_" + str(idx)
             config_groups[group_name] = scheme
 

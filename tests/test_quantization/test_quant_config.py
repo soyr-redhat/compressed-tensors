@@ -10,11 +10,13 @@ from compressed_tensors.quantization import (
     QuantizationConfig,
     QuantizationScheme,
     QuantizationStatus,
+    apply_quantization_config,
 )
 from compressed_tensors.quantization.quant_config import (
     _map_to_checkpoint_names,
     get_vllm_module_type,
 )
+from compressed_tensors.utils.match import match_named_modules
 from pydantic import ValidationError
 from transformers import AutoModelForImageTextToText
 from transformers.core_model_loading import WeightRenaming
@@ -231,6 +233,109 @@ def test_export_named_targets_preserves_overlapping_group_assignments():
     assert exported.config_groups["group_1"].targets == ["checkpoint.1"]
     assert broad.targets == [r"re:^runtime\."]
     assert specific.targets == ["runtime.1"]
+
+
+@pytest.mark.parametrize(
+    "targets",
+    [["attention.0"], [r"re:^attention\."], ["Linear", r"re:^attention\."]],
+)
+def test_export_preserves_targets_with_unrelated_conversions(targets):
+    model = torch.nn.Module()
+    model.attention = torch.nn.Sequential(*(torch.nn.Linear(4, 4) for _ in range(64)))
+    model.expert = torch.nn.Embedding(4, 4)
+    model._weight_conversions = [
+        WeightRenaming("checkpoint.expert.weight", "expert.weight")
+    ]
+    scheme = QuantizationScheme(targets=targets, weights=QuantizationArgs())
+    for _, module in match_named_modules(model, targets):
+        module.quantization_scheme = scheme
+        module.quantization_status = QuantizationStatus.FROZEN
+
+    first = QuantizationConfig.from_pretrained(model)
+    second = QuantizationConfig.from_pretrained(model)
+
+    assert first == second
+    assert first.config_groups["group_0"].targets == targets
+    assert scheme.targets == targets
+
+
+def test_export_preserves_regex_when_renamed_modules_still_match():
+    model = torch.nn.Module()
+    model.attention = torch.nn.Module()
+    model.attention.runtime = torch.nn.Linear(4, 4)
+    model._weight_conversions = [
+        WeightRenaming("attention.saved.weight", "attention.runtime.weight")
+    ]
+    targets = [r"re:^attention\."]
+    scheme = QuantizationScheme(targets=targets, weights=QuantizationArgs())
+    model.attention.runtime.quantization_scheme = scheme
+    model.attention.runtime.quantization_status = QuantizationStatus.FROZEN
+
+    exported = QuantizationConfig.from_pretrained(model)
+
+    assert exported.config_groups["group_0"].targets == targets
+    checkpoint = torch.nn.Module()
+    checkpoint.attention = torch.nn.Module()
+    checkpoint.attention.saved = torch.nn.Linear(4, 4)
+    apply_quantization_config(checkpoint, exported)
+    assert checkpoint.attention.saved.quantization_scheme.weights == scheme.weights
+
+
+def test_export_preserves_groups_when_rename_enters_another_groups_regex():
+    model = torch.nn.Module()
+    model.runtime = torch.nn.Sequential(torch.nn.Linear(4, 4))
+    model.other = torch.nn.Linear(4, 4)
+    model._weight_conversions = [WeightRenaming("runtime.1.weight", "other.weight")]
+    broad = QuantizationScheme(targets=[r"re:^runtime\."], weights=QuantizationArgs())
+    specific = QuantizationScheme(
+        targets=["other"], weights=QuantizationArgs(num_bits=4)
+    )
+    model.runtime[0].quantization_scheme = broad
+    model.other.quantization_scheme = specific
+    for module in (model.runtime[0], model.other):
+        module.quantization_status = QuantizationStatus.FROZEN
+
+    exported = QuantizationConfig.from_pretrained(model)
+
+    assert exported.config_groups["group_0"].targets == ["runtime.0"]
+    assert exported.config_groups["group_1"].targets == ["runtime.1"]
+    checkpoint = torch.nn.Module()
+    checkpoint.runtime = torch.nn.Sequential(
+        torch.nn.Linear(4, 4), torch.nn.Linear(4, 4)
+    )
+    apply_quantization_config(checkpoint, exported)
+    assert checkpoint.runtime[0].quantization_scheme.weights.num_bits == 8
+    assert checkpoint.runtime[1].quantization_scheme.weights.num_bits == 4
+
+
+def test_export_preserves_exact_target_priority_over_regex_after_rename():
+    model = torch.nn.Module()
+    model.runtime = torch.nn.Sequential(torch.nn.Linear(4, 4), torch.nn.Linear(4, 4))
+    model._weight_conversions = [
+        WeightRenaming("runtime.saved.weight", "runtime.0.weight")
+    ]
+    specific = QuantizationScheme(
+        targets=["runtime.0", r"re:^runtime\."], weights=QuantizationArgs()
+    )
+    broad = QuantizationScheme(
+        targets=[r"re:^runtime\."], weights=QuantizationArgs(num_bits=4)
+    )
+    model.runtime[0].quantization_scheme = specific
+    model.runtime[1].quantization_scheme = broad
+    for module in model.runtime:
+        module.quantization_status = QuantizationStatus.FROZEN
+
+    exported = QuantizationConfig.from_pretrained(model)
+
+    assert exported.config_groups["group_0"].targets == ["runtime.saved"]
+    assert exported.config_groups["group_1"].targets == broad.targets
+    checkpoint = torch.nn.Module()
+    checkpoint.runtime = torch.nn.ModuleDict(
+        {"saved": torch.nn.Linear(4, 4), "1": torch.nn.Linear(4, 4)}
+    )
+    apply_quantization_config(checkpoint, exported)
+    assert checkpoint.runtime["saved"].quantization_scheme.weights.num_bits == 8
+    assert checkpoint.runtime["1"].quantization_scheme.weights.num_bits == 4
 
 
 def test_get_vllm_module_type():
