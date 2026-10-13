@@ -187,6 +187,31 @@ def test_export_targets_uses_checkpoint_names_without_mutating_scheme(targets):
     assert model.runtime[0].quantization_scheme.targets == targets
 
 
+def test_export_mixed_targets_preserves_backbone_and_mtp_assignments():
+    model = torch.nn.Module()
+    model.backbone = torch.nn.Linear(4, 4)
+    model.mtp = torch.nn.Sequential(torch.nn.Linear(4, 4))
+    model._weight_conversions = [
+        WeightRenaming("checkpoint.backbone.weight", "backbone.weight"),
+        WeightRenaming("checkpoint.mtp.weight", "mtp.0.weight"),
+    ]
+    targets = ["Linear", r"re:^mtp\."]
+    scheme = QuantizationScheme(targets=targets, weights=QuantizationArgs())
+    for module in (model.backbone, model.mtp[0]):
+        module.quantization_scheme = scheme
+        module.quantization_status = QuantizationStatus.FROZEN
+
+    first = QuantizationConfig.from_pretrained(model)
+    second = QuantizationConfig.from_pretrained(model)
+
+    assert first == second
+    assert first.config_groups["group_0"].targets == [
+        "checkpoint.backbone",
+        "checkpoint.mtp",
+    ]
+    assert scheme.targets == targets
+
+
 def test_export_named_targets_preserves_overlapping_group_assignments():
     model = torch.nn.Module()
     model.runtime = torch.nn.Sequential(torch.nn.Linear(4, 4), torch.nn.Linear(4, 4))
