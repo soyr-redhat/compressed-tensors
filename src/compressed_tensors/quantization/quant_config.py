@@ -45,6 +45,8 @@ def _map_to_checkpoint_names(model: Module, names: list[str]) -> list[str]:
     result = []
     for name in names:
         # Some conversions match a complete weight key or a trailing dot.
+        # This assumes Linear-style `.weight` parameters, which is naive and not great.
+        # Conversions specific to other parameter names are not handled.
         name += ".weight"
         for rev in inverted:
             renamed, matched = rev.rename_source_key(name)
@@ -259,19 +261,15 @@ class QuantizationConfig(BaseModel):
 
         consolidated_ignore = _map_to_checkpoint_names(model, consolidated_ignore)
 
-        named_modules = {}
-        checkpoint_names = {}
-        renamed_modules = {}
-        if getattr(model, "_weight_conversions", None):
-            named_modules = dict(model.named_modules())
-            checkpoint_names = dict(
-                zip(named_modules, _map_to_checkpoint_names(model, list(named_modules)))
-            )
-            renamed_modules = {
-                name: module
-                for name, module in named_modules.items()
-                if checkpoint_names[name] != name
-            }
+        named_modules = dict(model.named_modules())
+        checkpoint_names = dict(
+            zip(named_modules, _map_to_checkpoint_names(model, list(named_modules)))
+        )
+        renamed_modules = {
+            name: module
+            for name, module in named_modules.items()
+            if checkpoint_names[name] != name
+        }
 
         # create config groups from all unique schemes
         config_groups = {}
