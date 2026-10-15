@@ -214,9 +214,10 @@ def test_export_mixed_targets_preserves_backbone_and_mtp_assignments():
     assert scheme.targets == targets
 
 
-def test_export_named_targets_preserves_overlapping_group_assignments():
+@pytest.mark.parametrize("copy_scheme", [False, True])
+def test_export_named_targets_preserves_overlapping_group_assignments(copy_scheme):
     model = torch.nn.Module()
-    model.runtime = torch.nn.Sequential(torch.nn.Linear(4, 4), torch.nn.Linear(4, 4))
+    model.runtime = torch.nn.Sequential(*(torch.nn.Linear(4, 4) for _ in range(3)))
     model._weight_conversions = [WeightRenaming("checkpoint.", "runtime.")]
     broad = QuantizationScheme(targets=[r"re:^runtime\."], weights=QuantizationArgs())
     specific = QuantizationScheme(
@@ -224,15 +225,74 @@ def test_export_named_targets_preserves_overlapping_group_assignments():
     )
     model.runtime[0].quantization_scheme = broad
     model.runtime[1].quantization_scheme = specific
+    model.runtime[2].quantization_scheme = broad.model_copy() if copy_scheme else broad
     for module in model.runtime:
         module.quantization_status = QuantizationStatus.FROZEN
 
     exported = QuantizationConfig.from_pretrained(model)
 
-    assert exported.config_groups["group_0"].targets == ["checkpoint.0"]
+    assert exported.config_groups["group_0"].targets == ["checkpoint.0", "checkpoint.2"]
     assert exported.config_groups["group_1"].targets == ["checkpoint.1"]
     assert broad.targets == [r"re:^runtime\."]
     assert specific.targets == ["runtime.1"]
+
+
+@pytest.mark.parametrize("include_linear", [False, True])
+def test_export_preserves_kv_cache_assignments(include_linear):
+    class CacheAttention(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.k_proj = torch.nn.Linear(4, 4)
+
+        def forward(self, hidden_states, past_key_value=None):
+            return hidden_states
+
+    model = torch.nn.Module()
+    model.runtime = torch.nn.ModuleDict({"attention": CacheAttention()})
+    model._weight_conversions = [WeightRenaming("checkpoint.", "runtime.")]
+    scheme = QuantizationScheme(
+        targets=[r"re:^runtime\."], input_activations=QuantizationArgs()
+    )
+    model.runtime["attention"].quantization_scheme = scheme.model_copy()
+    model.runtime["attention"].quantization_status = QuantizationStatus.FROZEN
+    if include_linear:
+        model.runtime["linear"] = torch.nn.Linear(4, 4)
+        model.runtime["linear"].quantization_scheme = scheme
+        model.runtime["linear"].quantization_status = QuantizationStatus.FROZEN
+
+    exported = QuantizationConfig.from_pretrained(model)
+
+    assert exported.kv_cache_scheme == scheme.input_activations
+    if include_linear:
+        assert exported.config_groups["group_0"].targets == [
+            "checkpoint.attention",
+            "checkpoint.linear",
+        ]
+    else:
+        assert exported.config_groups == {}
+
+
+def test_export_excludes_unquantized_module_renamed_into_target():
+    model = torch.nn.Module()
+    model.runtime = torch.nn.Sequential(torch.nn.Linear(4, 4))
+    model.other = torch.nn.Embedding(4, 4)
+    model._weight_conversions = [WeightRenaming("runtime.saved.weight", "other.weight")]
+    scheme = QuantizationScheme(targets=[r"re:^runtime\."], weights=QuantizationArgs())
+    model.runtime[0].quantization_scheme = scheme
+    model.runtime[0].quantization_status = QuantizationStatus.FROZEN
+
+    exported = QuantizationConfig.from_pretrained(model)
+
+    # Embedding is not in ignore: retaining the regex would quantize it on reload.
+    assert exported.ignore == []
+    assert exported.config_groups["group_0"].targets == ["runtime.0"]
+    checkpoint = torch.nn.Module()
+    checkpoint.runtime = torch.nn.ModuleDict(
+        {"0": torch.nn.Linear(4, 4), "saved": torch.nn.Embedding(4, 4)}
+    )
+    apply_quantization_config(checkpoint, exported)
+    assert checkpoint.runtime["0"].quantization_scheme.weights == scheme.weights
+    assert not hasattr(checkpoint.runtime["saved"], "quantization_scheme")
 
 
 @pytest.mark.parametrize(

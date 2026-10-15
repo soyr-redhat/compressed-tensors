@@ -202,6 +202,8 @@ class QuantizationConfig(BaseModel):
         # set of all quantization schemes
         # TODO: make quant config/scheme/args frozen/hashable and use a set
         quantization_schemes: list[QuantizationScheme] = list()
+        scheme_indices: dict[int, int] = {}
+        scheme_names: list[list[str]] | None = None
 
         # use any status from modules (in practice, use the last module)
         model_status = None
@@ -222,20 +224,28 @@ class QuantizationConfig(BaseModel):
             named_modules[name] = submodule
             layer_type: str = get_vllm_module_type(type(submodule).__name__)
             is_cached_attention = is_cached_attention_module(submodule)
+            is_quantized = is_module_quantized(submodule)
 
             # add config group if quantized non-attention or attention quant
-            has_config_group = is_module_quantized(submodule) and (
+            has_config_group = is_quantized and (
                 not is_cached_attention or hasattr(submodule, IMPL_ATTR)
             )
             # only add kvcache if quant attention (which always implies kvcache)
-            has_kv_cache = is_module_quantized(submodule) and is_cached_attention
+            has_kv_cache = is_quantized and is_cached_attention
 
             if has_config_group:
                 # add to running set of schemes/layer_type_names
                 model_status = getattr(submodule, "quantization_status", model_status)
                 quantization_type_names.add(layer_type)
-                if submodule.quantization_scheme not in quantization_schemes:
-                    quantization_schemes.append(submodule.quantization_scheme)
+                scheme = submodule.quantization_scheme
+                # Resolve shared schemes once, but still merge equal copies.
+                if id(scheme) not in scheme_indices:
+                    try:
+                        scheme_index = quantization_schemes.index(scheme)
+                    except ValueError:
+                        scheme_index = len(quantization_schemes)
+                        quantization_schemes.append(scheme)
+                    scheme_indices[id(scheme)] = scheme_index
 
             if has_kv_cache:
                 model_status = getattr(submodule, "quantization_status", model_status)
@@ -282,12 +292,26 @@ class QuantizationConfig(BaseModel):
                 != match_targets(checkpoint_names[name], module, scheme.targets)
                 for name, module in renamed_modules.items()
             ):
+                # Group assignments only when needed, once for all expanded groups.
+                if scheme_names is None:
+                    scheme_names = [[] for _ in quantization_schemes]
+                    for name, module in named_modules.items():
+                        assigned = getattr(module, "quantization_scheme", None)
+                        if assigned is None:
+                            continue
+                        if id(assigned) not in scheme_indices:
+                            try:
+                                assigned_index = quantization_schemes.index(assigned)
+                            except ValueError:
+                                assigned_index = -1
+                            scheme_indices[id(assigned)] = assigned_index
+                        assigned_index = scheme_indices[id(assigned)]
+                        if assigned_index >= 0:
+                            scheme_names[assigned_index].append(name)
                 scheme = scheme.model_copy(
                     update={
                         "targets": [
-                            checkpoint_names[name]
-                            for name, module in named_modules.items()
-                            if getattr(module, "quantization_scheme", None) == scheme
+                            checkpoint_names[name] for name in scheme_names[idx]
                         ]
                     }
                 )
