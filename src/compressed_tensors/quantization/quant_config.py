@@ -217,7 +217,9 @@ class QuantizationConfig(BaseModel):
         # this keeps track of any kvcache schemes
         kv_cache_scheme: QuantizationArgs | None = None
 
+        named_modules = {}
         for name, submodule in model.named_modules():
+            named_modules[name] = submodule
             layer_type: str = get_vllm_module_type(type(submodule).__name__)
             is_cached_attention = is_cached_attention_module(submodule)
 
@@ -259,12 +261,10 @@ class QuantizationConfig(BaseModel):
             # else we leave it off the ignore list, doesn't fall under any of the
             # existing quantization schemes so it won't be quantized
 
-        consolidated_ignore = _map_to_checkpoint_names(model, consolidated_ignore)
-
-        named_modules = dict(model.named_modules())
         checkpoint_names = dict(
             zip(named_modules, _map_to_checkpoint_names(model, list(named_modules)))
         )
+        consolidated_ignore = [checkpoint_names[name] for name in consolidated_ignore]
         renamed_modules = {
             name: module
             for name, module in named_modules.items()
