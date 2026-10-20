@@ -106,10 +106,6 @@ def save_mtp_tensors_to_checkpoint(
 
         quant_config = config.get(QUANTIZATION_CONFIG_NAME)
         if quant_config is not None:
-            from compressed_tensors.quantization.quant_config import (
-                _compact_checkpoint_ignores,
-            )
-
             ignore_list = quant_config.get("ignore") or []
             ignores = (
                 [
@@ -120,7 +116,7 @@ def save_mtp_tensors_to_checkpoint(
                 if source_weight_map is not None
                 else [f"re:^{mtp_prefix}.*"]
             )
-            updated_ignores = _compact_checkpoint_ignores([*ignore_list, *ignores])
+            updated_ignores = list(dict.fromkeys([*ignore_list, *ignores]))
             if updated_ignores != ignore_list:
                 quant_config["ignore"] = updated_ignores
                 with open(config_path, "w") as f:

@@ -106,10 +106,13 @@ class ModelCompressor:
             that should be applied to the entire model, overrides inferred formats
             for all quantized modules
         """
-        # Infer formats before target conversion copies the attached schemes.
-        format = infer_model_format(model, quantization_format)
-        quantization_config = QuantizationConfig.from_pretrained(model, format=format)
+        # reconstruct qconfig from qschemes that are attached to the model
+        quantization_config = QuantizationConfig.from_pretrained(model)
         transform_config = getattr(model, TRANSFORM_CONFIG_NAME, None)
+
+        # update quantization config format for better UX when reading config.json
+        if quantization_config is not None:
+            quantization_config.format = infer_model_format(model, quantization_format)
 
         return cls(
             quantization_config=quantization_config,

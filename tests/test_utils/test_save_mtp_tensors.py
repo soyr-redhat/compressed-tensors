@@ -227,7 +227,7 @@ class TestSaveMtpTensorsToCheckpoint:
         assert not (dest / SAFE_WEIGHTS_NAME).exists()
         assert set(get_weight_mappings(str(dest))) == set(index["weight_map"])
 
-    def test_selected_copy_preserves_weights_and_compact_ignores(
+    def test_selected_copy_preserves_weights_and_expanded_ignores(
         self, tmp_path, dest_dir_with_index
     ):
         source = tmp_path / "selected.safetensors"
@@ -241,7 +241,11 @@ class TestSaveMtpTensorsToCheckpoint:
         _make_safetensors(str(source), weights)
         config_path = dest_dir_with_index / "config.json"
         user_regex = "re:.*preserve.*"
-        initial = QuantizationConfig(config_groups={}, ignore=["lm_head", user_regex])
+        targets = ["Linear", r"re:^model\.layers\."]
+        initial = QuantizationConfig(
+            config_groups={"group_0": QuantizationScheme(targets=targets)},
+            ignore=["lm_head", user_regex],
+        )
         config_path.write_text(
             json.dumps({"quantization_config": initial.model_dump()})
         )
@@ -267,12 +271,13 @@ class TestSaveMtpTensorsToCheckpoint:
             *selected,
         }
         config = json.loads(config_path.read_text())["quantization_config"]
-        assert len(config["ignore"]) == 4
-        restored = QuantizationConfig.model_validate(config)
         names = [name.removesuffix(".weight") for name in selected]
-        assert set(restored.ignore) == {"lm_head", user_regex, *names}
+        assert config["ignore"] == ["lm_head", user_regex, *names]
+        assert config["config_groups"] == initial.model_dump()["config_groups"]
+        restored = QuantizationConfig.model_validate(config)
+        assert restored.ignore == ["lm_head", user_regex, *names]
         assert restored.model_dump()["ignore"] == config["ignore"]
-        # Generated exact ignores can be removed by a later pass; user regexes stay.
+        # Exact ignores can be removed by a later pass; user regexes stay.
         scheme = QuantizationScheme(targets=[names[0], user_regex], format="dense")
         with pytest.warns(UserWarning):
             restored.merge(QuantizationConfig(config_groups={"mtp": scheme}))

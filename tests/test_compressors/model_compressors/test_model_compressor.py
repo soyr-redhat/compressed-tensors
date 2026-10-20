@@ -20,7 +20,6 @@ from compressed_tensors.quantization import (
 from compressed_tensors.transform import TransformConfig
 from tests.test_offload.conftest import torchrun
 from tests.testing_utils import requires_gpu
-from transformers.core_model_loading import WeightRenaming
 
 
 class DummyLinear(nn.Module):
@@ -209,16 +208,10 @@ class TestModelCompressorCompression:
         assert model.linear.weight.dtype == torch.float32
         assert not hasattr(model.linear, "weight_packed")
 
-    @pytest.mark.parametrize("renamed", [False, True])
-    def test_compress_model_updates_format_in_config(self, renamed):
+    def test_compress_model_updates_format_in_config(self):
         """Test that from_pretrained_model infers and sets the format correctly."""
         model = DummyLinear()
         scheme = create_quantization_scheme(bits=4, type="int", strategy="channel")
-        if renamed:
-            scheme.targets = ["linear"]
-            model._weight_conversions = [
-                WeightRenaming("checkpoint.linear.", "linear.")
-            ]
         model.linear.quantization_scheme = scheme
         model.linear.quantization_status = QuantizationStatus.FROZEN
         model.linear.weight_scale = nn.Parameter(
@@ -234,10 +227,6 @@ class TestModelCompressorCompression:
 
         # Format should be inferred as pack-quantized
         assert compressor.quantization_config.format == CompressionFormat.pack_quantized
-        assert all(
-            group.format == CompressionFormat.pack_quantized
-            for group in compressor.quantization_config.config_groups.values()
-        )
 
 
 class TestModelCompressorConfigUpdate:
