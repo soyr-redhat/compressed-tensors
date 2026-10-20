@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 import pytest
 import torch
+from compressed_tensors.quantization import QuantizationConfig, QuantizationScheme
 from compressed_tensors.utils.mtp import save_mtp_tensors_to_checkpoint
 from compressed_tensors.utils.safetensors_load import get_weight_mappings
 from safetensors import safe_open
@@ -226,58 +227,59 @@ class TestSaveMtpTensorsToCheckpoint:
         assert not (dest / SAFE_WEIGHTS_NAME).exists()
         assert set(get_weight_mappings(str(dest))) == set(index["weight_map"])
 
-    def test_selected_weights_bypass_lookup_and_preserve_exact_ignores(
+    def test_selected_copy_preserves_weights_and_compact_ignores(
         self, tmp_path, dest_dir_with_index
     ):
         source = tmp_path / "selected.safetensors"
         weights = {
-            "model.layers.2.eh_proj.weight": torch.randn(4, 4),
-            "model.mtp.layers.0.proj.weight": torch.randn(4, 4),
-            "model.layers.0.weight": torch.randn(4, 4),
+            f"model.mtp.layers.0.experts.{i}.up_proj.weight": torch.randn(4, 4)
+            for i in range(32)
         }
+        weights["model.layers.2.eh_proj.weight"] = torch.randn(4, 4)
+        selected = dict.fromkeys(weights, str(source))
+        weights["model.layers.0.weight"] = torch.randn(4, 4)
         _make_safetensors(str(source), weights)
-        selected = {
-            name: str(source) for name in weights if name != "model.layers.0.weight"
-        }
         config_path = dest_dir_with_index / "config.json"
+        user_regex = "re:.*preserve.*"
+        initial = QuantizationConfig(config_groups={}, ignore=["lm_head", user_regex])
         config_path.write_text(
-            json.dumps({"quantization_config": {"ignore": ["lm_head"]}})
+            json.dumps({"quantization_config": initial.model_dump()})
         )
-
+        index_path = dest_dir_with_index / SAFE_WEIGHTS_INDEX_NAME
+        snapshots = []
         with patch(
-            "compressed_tensors.utils.mtp._fetch_and_save_prefix_tensors",
-            side_effect=AssertionError(
-                "selected shards must not trigger source lookup"
-            ),
-        ):
-            for iteration in range(2):
-                with patch("builtins.open", wraps=open) as opened:
-                    save_mtp_tensors_to_checkpoint(
-                        "unused/source",
-                        str(dest_dir_with_index),
-                        source_weight_map=selected,
-                    )
-                config_writes = [
-                    call
-                    for call in opened.call_args_list
-                    if os.fspath(call.args[0]) == str(config_path)
-                    and "w"
-                    in (
-                        call.args[1]
-                        if len(call.args) > 1
-                        else call.kwargs.get("mode", "r")
-                    )
-                ]
-                assert len(config_writes) == (1 if iteration == 0 else 0)
-
+            "compressed_tensors.utils.mtp._fetch_and_save_prefix_tensors"
+        ) as fetch:
+            for _ in range(2):
+                save_mtp_tensors_to_checkpoint(
+                    "unused/source",
+                    str(dest_dir_with_index),
+                    source_weight_map=selected,
+                )
+                snapshots.append((config_path.read_bytes(), index_path.read_bytes()))
+            fetch.assert_not_called()
+        assert snapshots[0] == snapshots[1]
         saved = _read_safetensors(str(dest_dir_with_index / "model_mtp.safetensors"))
         assert set(saved) == set(selected)
-        for name, tensor in saved.items():
-            assert torch.equal(tensor, weights[name])
-        assert json.loads(config_path.read_text())["quantization_config"]["ignore"] == [
-            "lm_head",
-            *[name.removesuffix(".weight") for name in selected],
-        ]
+        assert all(torch.equal(tensor, weights[name]) for name, tensor in saved.items())
+        assert set(get_weight_mappings(str(dest_dir_with_index))) == {
+            "model.layer0.weight",
+            *selected,
+        }
+        config = json.loads(config_path.read_text())["quantization_config"]
+        assert len(config["ignore"]) == 4
+        restored = QuantizationConfig.model_validate(config)
+        names = [name.removesuffix(".weight") for name in selected]
+        assert set(restored.ignore) == {"lm_head", user_regex, *names}
+        assert restored.model_dump()["ignore"] == config["ignore"]
+        # Generated exact ignores can be removed by a later pass; user regexes stay.
+        scheme = QuantizationScheme(targets=[names[0], user_regex], format="dense")
+        with pytest.warns(UserWarning):
+            restored.merge(QuantizationConfig(config_groups={"mtp": scheme}))
+        expected = {"lm_head", user_regex, *names[1:]}
+        assert set(restored.ignore) == expected
+        reloaded = QuantizationConfig.model_validate_json(restored.model_dump_json())
+        assert set(reloaded.ignore) == expected
 
     def test_empty_selection_warns_without_prefix_lookup(self, tmp_path):
         with (

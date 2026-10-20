@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
 import re
 import warnings
 from collections import defaultdict
@@ -15,7 +16,7 @@ from compressed_tensors.quantization.quant_scheme import (
 from compressed_tensors.quantization.utils import is_module_quantized
 from compressed_tensors.utils import find_unique_name
 from compressed_tensors.utils.match import match_name, match_targets
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator
 from torch.nn import Module
 
 
@@ -54,6 +55,129 @@ def _map_to_checkpoint_names(model: Module, names: list[str]) -> list[str]:
                 name = renamed
         result.append(name.removesuffix(".weight"))
 
+    return result
+
+
+def _compact_checkpoint_targets(names: list[str]) -> list[str]:
+    """Factor exact paths into regexes, preserving namespace prefixes."""
+    if len(names) <= 1:
+        return names
+
+    trees = {}
+    for name in sorted(set(names)):
+        parts = name.split(".")
+        # Keep the prefix before indexed layers literal for serving-side mappers.
+        split = next(
+            (i for i, part in enumerate(parts) if part.isdecimal()), len(parts) - 1
+        )
+        prefix = ".".join(parts[:split])
+        node = trees.setdefault(prefix, {})
+        for part in parts[split:]:
+            node = node.setdefault(part, {})
+        node[None] = {}
+
+    def pattern(node: dict, separator: str = r"\.", digits: bool = False) -> str:
+        # Only combine siblings with identical suffixes: independent unions of
+        # each path component would introduce names that were never assigned.
+        suffixes = defaultdict(list)
+        for part, child in node.items():
+            if part is not None:
+                suffixes[pattern(child, "" if digits else r"\.", digits)].append(
+                    re.escape(part)
+                )
+        branches = [""] if None in node else []
+        for suffix, parts in suffixes.items():
+            if len(parts) > 1 and all(
+                part.isascii() and part.isdecimal() for part in parts
+            ):
+                if digits:
+                    chars = "".join(sorted(parts))
+                    if len(chars) > 2 and ord(chars[-1]) - ord(chars[0]) + 1 == len(
+                        chars
+                    ):
+                        chars = f"{chars[0]}-{chars[-1]}"
+                    parts = [f"[{chars}]"]
+                else:
+                    # Separate widths so compaction cannot introduce leading zeros.
+                    digit_trees = {}
+                    for number in parts:
+                        child = digit_trees.setdefault(len(number), {})
+                        for digit in number:
+                            child = child.setdefault(digit, {})
+                        child[None] = {}
+                    parts = [pattern(tree, "", True) for tree in digit_trees.values()]
+            prefix = parts[0] if len(parts) == 1 else f"(?:{'|'.join(parts)})"
+            branches.append(separator + prefix + suffix)
+        return branches[0] if len(branches) == 1 else f"(?:{'|'.join(branches)})"
+
+    return [
+        "re:^" + re.escape(prefix) + pattern(tree, r"\." if prefix else "") + r"\Z"
+        for prefix, tree in trees.items()
+    ]
+
+
+_COMPACT_IGNORE_SUFFIX = r"\Z(?#ct-exact)"
+
+
+def _expand_checkpoint_ignore(target: str) -> list[str]:
+    """Decode only our finite generated regexes; user regexes remain unchanged."""
+    if not (target.startswith("re:^") and target.endswith(_COMPACT_IGNORE_SUFFIX)):
+        return [target]
+    tokens = iter(
+        re.findall(
+            r"\\[\s\S]|\(\?:|\[[0-9-]+\]|.",
+            target[4 : -len(_COMPACT_IGNORE_SUFFIX)],
+            re.DOTALL,
+        )
+    )
+
+    def expand(nested=False):
+        names, alternatives = [""], []
+        for token in tokens:
+            if token == ")" and nested:
+                return alternatives + names
+            if token == "|":
+                alternatives.extend(names)
+                names = [""]
+                continue
+            if token == "(?:":
+                parts = expand(True)
+            elif token.startswith("["):
+                parts = [
+                    str(digit)
+                    for span in re.findall(r"[0-9]-[0-9]|[0-9]", token)
+                    for digit in range(int(span[0]), int(span[-1]) + 1)
+                ]
+            elif token.startswith("\\") or token not in ".^$*+?{}[]()":
+                parts = [token.removeprefix("\\")]
+            else:
+                raise ValueError(f"Invalid generated ignore pattern: {target}")
+            names = [name + part for name in names for part in parts]
+        if nested:
+            raise ValueError(f"Unclosed generated ignore pattern: {target}")
+        return alternatives + names
+
+    return expand()
+
+
+def _compact_checkpoint_ignores(ignores: list[str]) -> list[str]:
+    """Compact exact indexed names only when smaller, keeping other ignores literal."""
+    groups = defaultdict(list)
+    for target in ignores:
+        for name in _expand_checkpoint_ignore(target):
+            prefix = re.split(r"\.\d+(?:\.|$)", name, maxsplit=1)[0]
+            groups[prefix].append(name)
+    result = []
+    for names in groups.values():
+        names = list(dict.fromkeys(names))
+        if len(names) > 1 and not any(name.startswith("re:") for name in names):
+            compact = [
+                target.removesuffix(r"\Z") + _COMPACT_IGNORE_SUFFIX
+                for target in _compact_checkpoint_targets(names)
+            ]
+            if len(json.dumps(compact)) < len(json.dumps(names)):
+                names = compact
+        result.extend(names)
     return result
 
 
@@ -166,6 +290,19 @@ class QuantizationConfig(BaseModel):
     global_compression_ratio: float | None = None
     ignore: list[str] | None = Field(default_factory=list)
 
+    @field_validator("ignore")
+    @classmethod
+    def _expand_ignore(cls, ignores):
+        if ignores is None:
+            return None
+        return [
+            name for target in ignores for name in _expand_checkpoint_ignore(target)
+        ]
+
+    @field_serializer("ignore")
+    def _serialize_ignore(self, ignores):
+        return _compact_checkpoint_ignores(ignores) if ignores is not None else None
+
     def model_post_init(self, __context):
         """
         updates any quantization schemes defined as presets to be fully loaded
@@ -202,6 +339,7 @@ class QuantizationConfig(BaseModel):
         # set of all quantization schemes
         # TODO: make quant config/scheme/args frozen/hashable and use a set
         quantization_schemes: list[QuantizationScheme] = list()
+        scheme_indices: dict[int, int] = {}
 
         # use any status from modules (in practice, use the last module)
         model_status = None
@@ -217,23 +355,39 @@ class QuantizationConfig(BaseModel):
         # this keeps track of any kvcache schemes
         kv_cache_scheme: QuantizationArgs | None = None
 
+        has_weight_conversions = bool(getattr(model, "_weight_conversions", None))
+        named_modules = {}
+        quantized_names = []
         for name, submodule in model.named_modules():
             layer_type: str = get_vllm_module_type(type(submodule).__name__)
             is_cached_attention = is_cached_attention_module(submodule)
+            is_quantized = is_module_quantized(submodule)
+            # Retain module references only when checkpoint names can differ.
+            if has_weight_conversions:
+                named_modules[name] = submodule
+                if is_quantized:
+                    quantized_names.append(name)
 
             # add config group if quantized non-attention or attention quant
-            has_config_group = is_module_quantized(submodule) and (
+            has_config_group = is_quantized and (
                 not is_cached_attention or hasattr(submodule, IMPL_ATTR)
             )
             # only add kvcache if quant attention (which always implies kvcache)
-            has_kv_cache = is_module_quantized(submodule) and is_cached_attention
+            has_kv_cache = is_quantized and is_cached_attention
 
             if has_config_group:
                 # add to running set of schemes/layer_type_names
                 model_status = getattr(submodule, "quantization_status", model_status)
                 quantization_type_names.add(layer_type)
-                if submodule.quantization_scheme not in quantization_schemes:
-                    quantization_schemes.append(submodule.quantization_scheme)
+                scheme = submodule.quantization_scheme
+                # Resolve shared schemes once, but still merge equal copies.
+                if id(scheme) not in scheme_indices:
+                    try:
+                        scheme_index = quantization_schemes.index(scheme)
+                    except ValueError:
+                        scheme_index = len(quantization_schemes)
+                        quantization_schemes.append(scheme)
+                    scheme_indices[id(scheme)] = scheme_index
 
             if has_kv_cache:
                 model_status = getattr(submodule, "quantization_status", model_status)
@@ -241,8 +395,6 @@ class QuantizationConfig(BaseModel):
 
             if not has_config_group:
                 # add non-quantized layers to the ignore list
-                if layer_type not in ignore:
-                    ignore[layer_type] = []
                 ignore[layer_type].append(name)
 
         if (
@@ -259,36 +411,71 @@ class QuantizationConfig(BaseModel):
             # else we leave it off the ignore list, doesn't fall under any of the
             # existing quantization schemes so it won't be quantized
 
-        consolidated_ignore = _map_to_checkpoint_names(model, consolidated_ignore)
-
-        named_modules = dict(model.named_modules())
-        checkpoint_names = dict(
-            zip(named_modules, _map_to_checkpoint_names(model, list(named_modules)))
-        )
-        renamed_modules = {
-            name: module
-            for name, module in named_modules.items()
-            if checkpoint_names[name] != name
+        class_targets = {
+            cls.__name__
+            for module_type in {type(module) for module in named_modules.values()}
+            for cls in module_type.__mro__
+            if issubclass(cls, Module)
         }
+        class_targets.difference_update(named_modules)
+        checkpoint_names = {}
+
+        def map_and_check_targets(names: list[str]) -> bool:
+            mapped = _map_to_checkpoint_names(model, names)
+            checkpoint_names.update(zip(names, mapped))
+            return any(
+                match_targets(name, named_modules[name], scheme.targets)
+                != match_targets(saved, named_modules[name], scheme.targets)
+                for name, saved in zip(names, mapped)
+                if name != saved
+                for scheme in quantization_schemes
+            )
+
+        names = list(named_modules) if has_weight_conversions else consolidated_ignore
+        # Class names can also be exact saved names: keep the full collision check.
+        if has_weight_conversions and not any(
+            set(scheme.targets).issubset(class_targets)
+            for scheme in quantization_schemes
+        ):
+            names = list(dict.fromkeys([*quantized_names, *consolidated_ignore]))
+        remap_targets = map_and_check_targets(names)
+        # Once all name-based groups need rebuilding, unrelated names cannot change
+        # their assignments. Otherwise check for unquantized modules entering targets.
+        if not remap_targets and len(checkpoint_names) < len(named_modules):
+            remap_targets = map_and_check_targets(
+                [name for name in named_modules if name not in checkpoint_names]
+            )
+        class_targets.difference_update(checkpoint_names.values())
+        consolidated_ignore = [checkpoint_names[name] for name in consolidated_ignore]
+
+        # Group assignments once, only when target conversion needs them.
+        if remap_targets:
+            scheme_names = [[] for _ in quantization_schemes]
+            for name in quantized_names:
+                assigned = named_modules[name].quantization_scheme
+                if id(assigned) not in scheme_indices:
+                    # KV-cache-only modules may share an equal config-group scheme.
+                    try:
+                        assigned_index = quantization_schemes.index(assigned)
+                    except ValueError:
+                        assigned_index = -1
+                    scheme_indices[id(assigned)] = assigned_index
+                assigned_index = scheme_indices[id(assigned)]
+                if assigned_index >= 0:
+                    scheme_names[assigned_index].append(name)
 
         # create config groups from all unique schemes
         config_groups = {}
         for idx, scheme in enumerate(quantization_schemes):
-            # Preserve compact targets unless renaming changes their matches or
-            # specificity. Check other groups' modules too: a rename can bring
-            # them into this scheme's regex. Expand from actual assignments.
-            if any(
-                match_targets(name, module, scheme.targets)
-                != match_targets(checkpoint_names[name], module, scheme.targets)
-                for name, module in renamed_modules.items()
-            ):
+            # Rebuild name-based groups together: replacing exact names with regexes
+            # must not change precedence against another group's retained regex.
+            # Class-only targets remain lower-priority defaults.
+            if remap_targets and not set(scheme.targets).issubset(class_targets):
                 scheme = scheme.model_copy(
                     update={
-                        "targets": [
-                            checkpoint_names[name]
-                            for name, module in named_modules.items()
-                            if getattr(module, "quantization_scheme", None) == scheme
-                        ]
+                        "targets": _compact_checkpoint_targets(
+                            [checkpoint_names[name] for name in scheme_names[idx]]
+                        )
                     }
                 )
             group_name = "group_" + str(idx)
