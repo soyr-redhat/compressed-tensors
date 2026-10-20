@@ -7,7 +7,7 @@ import warnings
 from collections import defaultdict
 from enum import Enum
 
-from compressed_tensors.config import CompressionFormat
+from compressed_tensors.config import CompressionFormat, ExpertSparsityConfig
 from compressed_tensors.quantization.quant_args import DynamicType, QuantizationArgs
 from compressed_tensors.quantization.quant_scheme import (
     QuantizationScheme,
@@ -280,6 +280,8 @@ class QuantizationConfig(BaseModel):
         compression ratio achieved by the quantization config
     :ignore: optional list of layers to ignore from config_groups. Layers in this list
         are not quantized even if they match up with a target in config_groups
+    :param moe_sparsity_config: optional ExpertSparsityConfig describing per-layer
+        MoE expert sparsity. If None, the model has no expert sparsity.
     """
 
     config_groups: dict[str, QuantizationScheme | list[str]]
@@ -289,6 +291,7 @@ class QuantizationConfig(BaseModel):
     quantization_status: QuantizationStatus = QuantizationStatus.INITIALIZED
     global_compression_ratio: float | None = None
     ignore: list[str] | None = Field(default_factory=list)
+    moe_sparsity_config: ExpertSparsityConfig | None = None
 
     @field_validator("ignore")
     @classmethod
