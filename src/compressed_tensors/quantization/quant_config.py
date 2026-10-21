@@ -57,15 +57,17 @@ def _map_to_checkpoint_names(model: Module, ignore_list: list[str]) -> list[str]
     return result
 
 
-def _checkpoint_targets(
+def _build_mtp_scheme_targets(
     schemes: list[QuantizationScheme],
     assignments: dict[str, int],
     checkpoint_names: dict[str, str],
 ) -> list[QuantizationScheme]:
-    """Describe assigned MTP/decoder subtrees in HF and checkpoint namespaces.
+    """Build compact targets that preserve each module's quantization scheme.
 
-    User regexes are not interpreted or mutated. Excluded quantizable modules
-    guard prefix stripping and subtree compaction against changing selection.
+    Targets match both HF module names and saved checkpoint names, so the
+    backbone and MTP keep their assigned schemes after renaming. Modules
+    not selected for quantization stay excluded. Return copies of the schemes
+    with the new targets, leaving the originals unchanged.
     """
     aliases = {}
     for name, checkpoint_name in checkpoint_names.items():
@@ -360,7 +362,7 @@ class QuantizationConfig(BaseModel):
         ):
             names = list(dict.fromkeys([*assignments, *excluded, *consolidated_ignore]))
             checkpoint_names = dict(zip(names, _map_to_checkpoint_names(model, names)))
-            quantization_schemes = _checkpoint_targets(
+            quantization_schemes = _build_mtp_scheme_targets(
                 quantization_schemes, assignments, checkpoint_names
             )
             consolidated_ignore = [
